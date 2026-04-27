@@ -1,1 +1,177 @@
-OPENAI_API_KEY=sk-your-openai-api-key-here
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from openai import OpenAI
+import json
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI(title="Audit AI Copilot API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# In-memory history store (replace with DB in production)
+analysis_history = []
+
+
+class AnalysisRequest(BaseModel):
+    process: str
+
+
+class FollowUpRequest(BaseModel):
+    process: str
+    previous_analysis: dict
+    question: str
+
+
+SYSTEM_PROMPT = """You are a senior internal auditor at a top-tier global investment bank with 20+ years of experience in risk management, compliance, and operational auditing. You have deep expertise in Basel III, SOX, DORA, MiFID II, and ISO 31000 frameworks.
+
+Your task is to analyze business processes and produce a structured audit report. Be precise, concise, and professional. Think like McKinsey meets Goldman Sachs internal audit division.
+
+ALWAYS respond with ONLY valid JSON — no markdown, no code fences, no extra text.
+
+Return exactly this JSON structure:
+{
+  "risks": [
+    {"id": "R1", "title": "Risk title", "description": "Concise description", "severity": "High|Medium|Low"}
+  ],
+  "control_gaps": [
+    {"id": "CG1", "title": "Gap title", "description": "Concise description", "severity": "High|Medium|Low"}
+  ],
+  "recommended_controls": [
+    {"id": "RC1", "title": "Control name", "description": "Specific control action", "framework": "COSO|ISO31000|Basel|SOX|COBIT"}
+  ],
+  "overall_severity": "High|Medium|Low",
+  "business_impact": {
+    "summary": "2-3 sentence executive summary of overall impact",
+    "financial_exposure": "Estimated financial risk range or qualitative assessment",
+    "regulatory_implications": "Key regulatory/compliance concerns",
+    "reputational_risk": "High|Medium|Low"
+  },
+  "audit_opinion": "One sentence professional audit opinion"
+}
+
+Rules:
+- Minimum 3 risks, 3 control gaps, 3 recommended controls
+- Be specific to the described process, not generic
+- Use precise financial/operational language
+- Severity must be High, Medium, or Low exactly"""
+
+
+@app.post("/analyze")
+async def analyze_process(request: AnalysisRequest):
+    if not request.process or len(request.process.strip()) < 20:
+        raise HTTPException(status_code=400, detail="Process description too short. Provide at least 20 characters.")
+
+    if len(request.process) > 5000:
+        raise HTTPException(status_code=400, detail="Process description too long. Max 5000 characters.")
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": f"Analyze this business process and return structured JSON:\n\n{request.process}"
+                }
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+            response_format={"type": "json_object"}
+        )
+
+        raw = response.choices[0].message.content
+        result = json.loads(raw)
+
+        # Store in history
+        history_entry = {
+            "id": len(analysis_history) + 1,
+            "timestamp": datetime.utcnow().isoformat(),
+            "process_snippet": request.process[:120] + "..." if len(request.process) > 120 else request.process,
+            "overall_severity": result.get("overall_severity", "Unknown"),
+            "result": result
+        }
+        analysis_history.insert(0, history_entry)
+        if len(analysis_history) > 20:
+            analysis_history.pop()
+
+        return {"success": True, "data": result, "analysis_id": history_entry["id"]}
+
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse AI response. Please retry.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+
+@app.post("/followup")
+async def follow_up(request: FollowUpRequest):
+    if not request.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    try:
+        context = json.dumps(request.previous_analysis, indent=2)
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a senior internal auditor. Answer follow-up questions about an audit analysis concisely and professionally. Be specific, use financial/audit terminology. Max 3 paragraphs."
+                },
+                {
+                    "role": "user",
+                    "content": f"Original process:\n{request.process}\n\nAudit analysis:\n{context}\n\nQuestion: {request.question}"
+                }
+            ],
+            temperature=0.4,
+            max_tokens=600
+        )
+
+        return {
+            "success": True,
+            "answer": response.choices[0].message.content
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Follow-up failed: {str(e)}")
+
+
+@app.get("/history")
+async def get_history():
+    return {
+        "success": True,
+        "data": [
+            {
+                "id": h["id"],
+                "timestamp": h["timestamp"],
+                "process_snippet": h["process_snippet"],
+                "overall_severity": h["overall_severity"]
+            }
+            for h in analysis_history
+        ]
+    }
+
+
+@app.get("/history/{analysis_id}")
+async def get_analysis(analysis_id: int):
+    entry = next((h for h in analysis_history if h["id"] == analysis_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Analysis not found.")
+    return {"success": True, "data": entry}
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "1.0.0"}
+
