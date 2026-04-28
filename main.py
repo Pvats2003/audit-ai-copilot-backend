@@ -252,4 +252,4 @@ async def get_analysis(analysis_id: int):
 async def health():
     return {"status": "ok", "version": "2.0.0", "engine": "rule-based + llm"}
 
-- Ensure rules always run (even if LLM fails)
+- Ensure rules always run (even if LLM fails
