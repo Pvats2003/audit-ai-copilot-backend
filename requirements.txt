@@ -4,3 +4,12 @@ openai
 python-dotenv
 pydantic
 python-multipart
+pypdf
+python-docx
+reportlab
+pypdf
+python-docx
+reportlab
+pypdf
+python-docx
+reportlab
